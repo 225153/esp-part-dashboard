@@ -1,69 +1,133 @@
 #include <Arduino.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <DHT.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include <BLE2902.h>
+#include "config.h"
 
-// Define DHT Sensor settings
-#define DHTPIN 4       // Connect the DHT11 signal pin to GPIO 4 (D4)
+// --- BLE Configuration ---
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+BLECharacteristic *pCharacteristic;
+bool deviceConnected = false;
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+      Serial.println("BLE Client Connected!");
+    };
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+      Serial.println("BLE Client Disconnected!");
+      BLEDevice::startAdvertising();
+    }
+};
+
+// --- Sensor Settings ---
+#define DHTPIN 4
 #define DHTTYPE DHT11
-
-// Define MQ7 Sensor settings
-#define MQ7PIN 34      // Connect the MQ7 analog output to GPIO 34 (ADC1_CH6)
+#define MQ7PIN 34
+#define CLIENT_ID 105 
 
 DHT dht(DHTPIN, DHTTYPE);
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
   
-  Serial.println("\n--- ESP32 Multi-Sensor Dashboard ---");
-  Serial.println("Monitoring: DHT11 (Temp/Hum) and MQ7 (CO Gas)");
-  
-  // Ensure G34 is set as input and ADC is configured for full range
+  // 1. Initialize BLE
+  BLEDevice::init("ESP32_SENSOR_HUB");
+  BLEServer *pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(
+                      CHARACTERISTIC_UUID,
+                      BLECharacteristic::PROPERTY_READ   |
+                      BLECharacteristic::PROPERTY_NOTIFY 
+                    );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  BLEDevice::startAdvertising();
+  Serial.println("BLE Advertising Started...");
+
+  /* 2. Local WiFi (Optional parallel connection) - Commented for BLE testing
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 5000) {
+    delay(500);
+    Serial.print(".");
+  }
+  */
+
+  // 3. Sensor Init
   pinMode(MQ7PIN, INPUT);
   analogSetAttenuation(ADC_11db);
-  analogReadResolution(12);
-  
   dht.begin();
 }
 
 void loop() {
-  // Wait a few seconds between measurements
-  delay(2000);
-
-  // --- DHT11 Readings ---
+  Serial.println("--- Loop Start ---");
+  
+  Serial.print("Reading Humidity... ");
   float h = dht.readHumidity();
+  Serial.print("Reading Temperature... ");
   float t = dht.readTemperature();
-
-  // --- MQ7 Readings with Averaging ---
+  Serial.println("Done.");
+  
+  Serial.print("Sampling MQ7... ");
   long sum = 0;
   for(int i=0; i<32; i++) {
     sum += analogRead(MQ7PIN);
+    delay(10); // Minimal delay between samples
   }
   int mq7Value = sum / 32;
-  float voltage = mq7Value * (3.3 / 4095.0);
+  Serial.println("Done.");
 
-  // Check if DHT reads failed
-  if (isnan(h) || isnan(t)) {
-    Serial.println("Failed to read from DHT sensor!");
+  Serial.println("Final JSON Values: T=" + String(t) + " H=" + String(h) + " MQ7=" + String(mq7Value));
+
+  if (isnan(t) || isnan(h)) {
+    Serial.println("!!! DHT Read Error - Check wiring on Pin 4 !!!");
+    delay(2000);
+    return;
+  }
+
+  // Prepare Payload
+  StaticJsonDocument<200> doc;
+  doc["client_id"] = CLIENT_ID;
+  doc["tmp"] = t;
+  doc["hum"] = h; // Added humidity to JSON
+  doc["gaz_level"] = mq7Value;
+  doc["ai_status"] = (mq7Value > 1500 || t > 35) ? "Warning" : "Normal";
+
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
+  Serial.println("JSON Payload: " + jsonPayload);
+
+  // Send via BLE Notify
+  if (deviceConnected) {
+    pCharacteristic->setValue(jsonPayload.c_str());
+    pCharacteristic->notify();
+    Serial.println(">>> BLE NOTIFIED SUCCESS <<<");
   } else {
-    Serial.print("Humidity: ");
-    Serial.print(h);
-    Serial.print("%  |  ");
-    Serial.print("Temperature: ");
-    Serial.print(t);
-    Serial.println("°C");
+    Serial.println(">>> BLE Client NOT connected - Advertising... <<<");
   }
 
-  // Display MQ7 Results
-  Serial.print("MQ7 Gas Value: ");
-  Serial.print(mq7Value);
-  Serial.print(" (Raw)  |  Approx Voltage: ");
-  Serial.print(voltage);
-  Serial.println("V");
-  
-  // Simple safety threshold example
-  if (mq7Value > 1500) {
-    Serial.println("WARNING: High Gas/CO levels detected!");
+  /* Keep original Supabase logic if WiFi is available - Commented for BLE testing
+  if (WiFi.status() == WL_CONNECTED) {
+    HTTPClient http;
+    http.begin(supabaseUrl); 
+    http.addHeader("apikey", supabaseKey);
+    http.addHeader("Authorization", "Bearer " + String(supabaseKey));
+    http.addHeader("Content-Type", "application/json");
+    int httpCode = http.POST(jsonPayload);
+    http.end();
   }
-  
-  Serial.println("---------------------------------------");
+  */
+
+  delay(5000); 
 }

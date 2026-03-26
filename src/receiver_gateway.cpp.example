@@ -1,0 +1,121 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <PubSubClient.h>  // MQTT Support
+#include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEScan.h>
+#include <BLEAdvertisedDevice.h>
+#include "config.h"
+
+// Matching UUIDs from Sender
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+static BLEAdvertisedDevice* myDevice;
+static bool doConnect = false;
+static bool connected = false;
+
+WiFiClient espClient;
+PubSubClient mqttClient(espClient);
+
+void connectToMQTT() {
+  while (!mqttClient.connected()) {
+    String clientId = "ESP32Receiver-";
+    clientId += String(random(0xffff), HEX);
+    if (mqttClient.connect(clientId.c_str())) {
+      Serial.println("MQTT connected");
+    } else {
+      Serial.print("MQTT failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 5 seconds");
+      delay(5000);
+    }
+  }
+}
+
+// Notification Callback
+static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+    String jsonStr = "";
+    for (int i = 0; i < length; i++) {
+        jsonStr += (char)pData[i];
+    }
+    Serial.print("BLE Data Received: ");
+    Serial.println(jsonStr);
+
+    if (!mqttClient.connected()) {
+      connectToMQTT();
+    }
+    
+    if (mqttClient.publish("esp32/sensor_data", jsonStr.c_str())) {
+      Serial.println("Data published successfully via MQTT!");
+    } else {
+      Serial.println("Failed to publish data via MQTT.");
+    }
+}
+
+// Advertising Device Callback
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+    }
+  }
+};
+
+bool connectToServer() {
+    BLEClient* pClient = BLEDevice::createClient();
+    pClient->connect(myDevice);
+    BLERemoteService* pRemoteService = pClient->getService(SERVICE_UUID);
+    if (pRemoteService == nullptr) return false;
+
+    BLERemoteCharacteristic* pRemoteCharacteristic = pRemoteService->getCharacteristic(CHARACTERISTIC_UUID);
+    if (pRemoteCharacteristic->canNotify())
+        pRemoteCharacteristic->registerForNotify(notifyCallback);
+
+    connected = true;
+    return true;
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nWiFi connected");
+
+  mqttClient.setServer("broker.hivemq.com", 1883);
+
+  BLEDevice::init("");
+  BLEScan* pBLEScan = BLEDevice::getScan();
+  pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+  pBLEScan->setInterval(1349);
+  pBLEScan->setWindow(449);
+  pBLEScan->setActiveScan(true);
+  pBLEScan->start(5, false);
+}
+
+void loop() {
+  if (doConnect == true) {
+    if (connectToServer()) {
+      Serial.println("Connected to BLE Server.");
+    }
+    doConnect = false;
+  }
+
+  if (connected) {
+    if (!mqttClient.connected()) {
+      connectToMQTT();
+    }
+    mqttClient.loop();
+  } else {
+    BLEDevice::getScan()->start(0);
+  }
+  
+  delay(1000);
+}
