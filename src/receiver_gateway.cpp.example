@@ -1,97 +1,146 @@
 #include <Arduino.h>
 #include <WiFi.h>
-#include <PubSubClient.h>  // MQTT Support
+#include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
-#include "config.h"
 
-// Matching UUIDs from Sender
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+/**
+ * STANDALONE RECEIVER GATEWAY (Single-File)
+ * -----------------------------------------
+ * This code runs on the SECOND ESP32.
+ * 1. Connects to Local WiFi.
+ * 2. Connects to Local Mosquitto Broker on PC.
+ * 3. Scans for "ESP32_SENSOR_HUB" BLE Server.
+ * 4. Forwards sensor JSON to MQTT topic: scs/enterprise/telemetry
+ */
+
+// --- WiFi & MQTT Configuration ---
+const char* ssid     = "Flybox_5587_EXT";      // Your WiFi SSID
+const char* password = "6edgxcwetind";        // Your WiFi Password
+const char* mqttServer = "192.168.1.10";       // !!! CHANGE THIS TO YOUR PC IP !!!
+const int mqttpPort  = 1883;
+const char* mqttTopic = "scs/enterprise/telemetry";
+
+// --- BLE Configuration ---
+static BLEUUID serviceUUID("4fafc201-1fb5-459e-8fcc-c5c9c331914b");
+static BLEUUID charUUID("beb5483e-36e1-4688-b7f5-ea07361b26a8");
 
 static BLEAdvertisedDevice* myDevice;
 static bool doConnect = false;
 static bool connected = false;
+static bool doScan = false;
 
 WiFiClient espClient;
 PubSubClient mqttClient(espClient);
 
-void connectToMQTT() {
+// --- MQTT Connection Helper ---
+void reconnectMQTT() {
   while (!mqttClient.connected()) {
-    String clientId = "ESP32Receiver-";
+    Serial.print("Attempting MQTT connection to ");
+    Serial.print(mqttServer);
+    Serial.println("...");
+    
+    // Create a random client ID
+    String clientId = "ESP32Gateway-";
     clientId += String(random(0xffff), HEX);
+    
     if (mqttClient.connect(clientId.c_str())) {
-      Serial.println("MQTT connected");
+      Serial.println("MQTT Connected Successfully!");
     } else {
-      Serial.print("MQTT failed, rc=");
+      Serial.print("MQTT Failed, rc=");
       Serial.print(mqttClient.state());
-      Serial.println(" retrying in 5 seconds");
+      Serial.println(" - Retrying in 5s");
       delay(5000);
     }
   }
 }
 
-// Notification Callback
+// --- BLE Notification Handler ---
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-    String jsonStr = "";
+    String jsonPayload = "";
     for (int i = 0; i < length; i++) {
-        jsonStr += (char)pData[i];
+        jsonPayload += (char)pData[i];
     }
-    Serial.print("BLE Data Received: ");
-    Serial.println(jsonStr);
+    Serial.println("BLE Received: " + jsonPayload);
 
-    if (!mqttClient.connected()) {
-      connectToMQTT();
-    }
+    // Forward to Local Mosquitto
+    if (!mqttClient.connected()) reconnectMQTT();
     
-    if (mqttClient.publish("esp32/sensor_data", jsonStr.c_str())) {
-      Serial.println("Data published successfully via MQTT!");
+    if (mqttClient.publish(mqttTopic, jsonPayload.c_str())) {
+        Serial.println(">>> Forwarded to Mosquitto: " + String(mqttTopic));
     } else {
-      Serial.println("Failed to publish data via MQTT.");
+        Serial.println("!!! Failed to Publish to MQTT !!!");
     }
 }
 
-// Advertising Device Callback
-class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
-  void onResult(BLEAdvertisedDevice advertisedDevice) {
-    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(BLEUUID(SERVICE_UUID))) {
-      BLEDevice::getScan()->stop();
-      myDevice = new BLEAdvertisedDevice(advertisedDevice);
-      doConnect = true;
-    }
+// --- BLE Client Callbacks ---
+class MyClientCallback : public BLEClientCallbacks {
+  void onConnect(BLEClient* pclient) {}
+  void onDisconnect(BLEClient* pclient) {
+    connected = false;
+    doScan = true;
+    Serial.println("BLE Disconnected from Hub");
   }
 };
 
 bool connectToServer() {
-    BLEClient* pClient = BLEDevice::createClient();
+    Serial.print("Connecting to Hub at ");
+    Serial.println(myDevice->getAddress().toString().c_str());
+    
+    BLEClient*  pClient  = BLEDevice::createClient();
+    pClient->setClientCallbacks(new MyClientCallback());
     pClient->connect(myDevice);
-    BLERemoteService* pRemoteService = pClient->getService(SERVICE_UUID);
-    if (pRemoteService == nullptr) return false;
 
-    BLERemoteCharacteristic* pRemoteCharacteristic = pRemoteService->getCharacteristic(CHARACTERISTIC_UUID);
-    if (pRemoteCharacteristic->canNotify())
-        pRemoteCharacteristic->registerForNotify(notifyCallback);
+    BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+    if (pRemoteService == nullptr) {
+      pClient->disconnect();
+      return false;
+    }
+
+    BLERemoteCharacteristic* pRemoteCharacteristic = pRemoteService->getCharacteristic(charUUID);
+    if (pRemoteCharacteristic == nullptr) {
+      pClient->disconnect();
+      return false;
+    }
+
+    if(pRemoteCharacteristic->canNotify())
+      pRemoteCharacteristic->registerForNotify(notifyCallback);
 
     connected = true;
     return true;
 }
 
+class MyAdvertisedDeviceCallbacks: public BLEAdvertisedDeviceCallbacks {
+  void onResult(BLEAdvertisedDevice advertisedDevice) {
+    if (advertisedDevice.haveServiceUUID() && advertisedDevice.isAdvertisingService(serviceUUID)) {
+      BLEDevice::getScan()->stop();
+      myDevice = new BLEAdvertisedDevice(advertisedDevice);
+      doConnect = true;
+      doScan = false;
+    }
+  }
+};
+
 void setup() {
   Serial.begin(115200);
-  
+  Serial.println("Gateway Booting...");
+
+  // 1. Connect WiFi
   WiFi.begin(ssid, password);
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
     Serial.print(".");
   }
-  Serial.println("\nWiFi connected");
+  Serial.println("\nWiFi Connected!");
 
-  mqttClient.setServer("broker.hivemq.com", 1883);
+  // 2. Setup MQTT
+  mqttClient.setServer(mqttServer, mqttpPort);
 
-  BLEDevice::init("");
+  // 3. Setup BLE
+  BLEDevice::init("ESP32_GATEWAY");
   BLEScan* pBLEScan = BLEDevice::getScan();
   pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
   pBLEScan->setInterval(1349);
@@ -101,21 +150,26 @@ void setup() {
 }
 
 void loop() {
+  // BLE Connection logic
   if (doConnect == true) {
     if (connectToServer()) {
-      Serial.println("Connected to BLE Server.");
+      Serial.println("BLE Connection Established!");
     }
     doConnect = false;
   }
 
-  if (connected) {
+  // Keep MQTT alive
+  if (WiFi.status() == WL_CONNECTED) {
     if (!mqttClient.connected()) {
-      connectToMQTT();
+      reconnectMQTT();
     }
     mqttClient.loop();
-  } else {
+  }
+
+  // Re-scan if lost connection
+  if (!connected && doScan) {
     BLEDevice::getScan()->start(0);
   }
-  
-  delay(1000);
+
+  delay(100);
 }
